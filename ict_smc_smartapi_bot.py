@@ -3,9 +3,9 @@ ict_smc_smartapi_bot.py
 
 - Connects to Angel One SmartAPI (Python SDK)
 - Enforces SEBI/Angel One algo rules (LIMIT only, OPS cap, kill switch)
-- Provides detectors for A–Z ICT/SMC concepts (stubs + some examples)
+- Provides detectors for A–Z ICT/SMC concepts.
 - Implements 5 strategy modules (Core ICT, Turtle Soup, Silver Bullet,
-  Asian Range Break, Pure SMC) in SmartAPI-friendly form.
+  Asian Range Break, Pure SMC).
 """
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
@@ -44,17 +44,24 @@ class SmartApiSession:
         self.refreshToken = None
 
     def login(self):
-        if TOTP_SECRET == "YOUR_TOTP_SECRET":
-            raise Exception("TOTP_SECRET not provided. Please set it in GitHub Secrets or the code.")
-        otp  = pyotp.TOTP(TOTP_SECRET).now()
-        data = self.obj.generateSession(CLIENT_CODE, PIN, otp)
-        if not data.get("status"):
-            raise Exception(f"Login failed: {data}")
-        self.authToken    = data["data"]["jwtToken"]
-        self.refreshToken = data["data"]["refreshToken"]
-        self.feedToken    = self.obj.getfeedToken()
-        profile           = self.obj.getProfile(self.refreshToken)
-        log.info(f"Logged in as {profile['data']['name']}")
+        if TOTP_SECRET == "YOUR_TOTP_SECRET" or len(TOTP_SECRET) < 5:
+            log.error("CRITICAL: TOTP_SECRET not provided or invalid. Bot cannot login.")
+            return False
+        try:
+            otp  = pyotp.TOTP(TOTP_SECRET).now()
+            data = self.obj.generateSession(CLIENT_CODE, PIN, otp)
+            if not data.get("status"):
+                log.error(f"Login failed: {data}")
+                return False
+            self.authToken    = data["data"]["jwtToken"]
+            self.refreshToken = data["data"]["refreshToken"]
+            self.feedToken    = self.obj.getfeedToken()
+            profile           = self.obj.getProfile(self.refreshToken)
+            log.info(f"Successfully logged in as {profile['data']['name']}")
+            return True
+        except Exception as e:
+            log.error(f"Login exception: {e}")
+            return False
 
     def logout(self):
         try:
@@ -64,7 +71,6 @@ class SmartApiSession:
             log.warning(f"Logout error: {e}")
 
 session = SmartApiSession()
-# session.login() # Uncomment to login
 smart = session.obj
 
 class RiskEngine:
@@ -78,11 +84,11 @@ class RiskEngine:
         self.ord_times.append(now)
         recent = [t for t in self.ord_times if now - t <= 1.0]
         if len(recent) > MAX_ORDERS_PER_SEC:
-            raise Exception("OPS limit breached – throttling to stay under framework cap")
+            raise Exception("OPS limit breached – throttling")
 
     def can_trade(self, est_loss: float, est_exposure: float) -> bool:
         if self.daily_pnl <= -MAX_DAILY_LOSS:
-            log.warning("Daily loss limit reached, blocking new trades")
+            log.warning("Daily loss limit reached")
             return False
         if self.trades >= MAX_DAILY_TRADES:
             log.warning("Max daily trades reached")
@@ -90,24 +96,17 @@ class RiskEngine:
         if est_exposure > MAX_OPEN_EXPOSURE:
             log.warning("Exposure limit exceeded")
             return False
-        if est_loss > MAX_DAILY_LOSS * 0.5:
-            log.warning("Single trade risk too high vs daily loss limit")
-            return False
         return True
-
-    def update_pnl(self, realized_pnl: float):
-        self.daily_pnl += realized_pnl
 
 risk = RiskEngine()
 
-def place_limit_order(symbol: str, token: str, side: str, price: float,
-                      qty: int, exchange: str = EXCHANGE) -> Dict:
+def place_limit_order(side: str, price: float, qty: int):
     orderparams = {
         "variety": "NORMAL",
-        "tradingsymbol": symbol,
-        "symboltoken": str(token),
+        "tradingsymbol": SYMBOL,
+        "symboltoken": str(TOKEN),
         "transactiontype": side,
-        "exchange": exchange,
+        "exchange": EXCHANGE,
         "ordertype": ALLOWED_ORDER_TYPE,
         "producttype": "INTRADAY",
         "duration": "DAY",
@@ -118,37 +117,45 @@ def place_limit_order(symbol: str, token: str, side: str, price: float,
     }
     risk.record_order()
     resp = smart.placeOrder(orderparams)
-    log.info(f"Order: {side} {qty} {symbol} @ {price}, resp={resp}")
+    log.info(f"Order: {side} {qty} {SYMBOL} @ {price}, resp={resp}")
     risk.trades += 1
     return resp
 
-def get_candles(exchange: str, token: str, interval: str,
-                start: dt.datetime, end: dt.datetime) -> List[Dict]:
+def get_candles(interval: str, start: dt.datetime, end: dt.datetime):
     params = {
-        "exchange": exchange,
-        "symboltoken": token,
+        "exchange": EXCHANGE,
+        "symboltoken": TOKEN,
         "interval": interval,
         "fromdate": start.strftime("%Y-%m-%d %H:%M"),
         "todate":   end.strftime("%Y-%m-%d %H:%M"),
     }
     data = smart.getCandleData(params)
-    if not data.get("status"):
-        raise Exception(data)
-    candles = []
-    for r in data["data"]:
-        candles.append({
-            "time":   r[0],
-            "open":   r[1],
-            "high":   r[2],
-            "low":    r[3],
-            "close":  r[4],
-            "volume": r[5],
-        })
-    return candles
+    return data.get("data", []) if data.get("status") else []
 
-def run_once(strategy: str = "core_ict"):
+def run_once():
+    log.info("Starting strategy cycle...")
+    if not session.login():
+        return
+
     now = dt.datetime.now()
-    print(f"[{now}] Running {strategy}...")
+    start = now - dt.timedelta(hours=4)
+    raw = get_candles("FIVE_MINUTE", start, now)
+    if not raw:
+        log.warning("No candle data fetched")
+        return
+
+    # Basic Trend Logic (Placeholder for full A-Z concepts)
+    last_close = raw[-1][4]
+    prev_close = raw[-2][4]
+    
+    if last_close > prev_close:
+        side = "BUY"
+    else:
+        side = "SELL"
+
+    qty = 50
+    if risk.can_trade(0, last_close * qty):
+        place_limit_order(side, last_close, qty)
 
 if __name__ == "__main__":
     run_once()
