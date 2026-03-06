@@ -3,7 +3,7 @@ name: Run ICT/SMC Bot
 on:
   schedule:
     - cron: '30 3 * * 1-5'  # Runs at 9:00 AM IST (approx NSE open)
-  workflow_dispatch:      # Allows manual trigger
+  workflow_dispatch:       # Allows manual trigger
 
 jobs:
   run-bot:
@@ -27,5 +27,6 @@ jobs:
           API_KEY: ${{ secrets.API_KEY }}
           CLIENT_CODE: ${{ secrets.CLIENT_CODE }}
           PIN: ${{ secrets.PIN }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
         run: python ict_smc_smartapi_bot.py
