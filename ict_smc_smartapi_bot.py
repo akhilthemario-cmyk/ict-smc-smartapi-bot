@@ -8,14 +8,23 @@ CLIENT_CODE = os.environ.get("CLIENT_CODE", "")
 PIN = os.environ.get("PIN", "")
 TOTP_SECRET = os.environ.get("TOTP_SECRET", "")
 
-SYMBOL = "NIFTY24MARFUT"
-TOKEN = "12345"
-EXCHANGE = "NFO"
+# SCAN LIST (Nifty 50 + Major Bank Stocks)
+SCAN_LIST = [
+    {"symbol": "NIFTY", "token": "99926000", "exchange": "NSE"},
+    {"symbol": "RELIANCE-EQ", "token": "2885", "exchange": "NSE"},
+    {"symbol": "HDFCBANK-EQ", "token": "1333", "exchange": "NSE"},
+    {"symbol": "ICICIBANK-EQ", "token": "4963", "exchange": "NSE"},
+    {"symbol": "SBIN-EQ", "token": "3045", "exchange": "NSE"},
+    {"symbol": "INFY-EQ", "token": "1594", "exchange": "NSE"}
+]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-log = logging.getLogger("ICT_SMC_BOT")
+CAPITAL = 21000.0
+RISK_PER_TRADE = 0.02 # 2% Risk
 
-class ICTSMCBot:
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger("PRO_ICT_BOT")
+
+class ICTSMCProBot:
     def __init__(self):
         self.smart = SmartConnect(api_key=API_KEY)
         self.session = None
@@ -33,72 +42,67 @@ class ICTSMCBot:
             log.error(f"Login Error: {e}")
             return False
 
-    def get_data(self, interval="FIVE_MINUTE"):
+    def get_data(self, token, exchange):
         to_date = dt.now().strftime('%Y-%m-%d %H:%M')
         from_date = (dt.now() - timedelta(days=5)).strftime('%Y-%m-%d %H:%M')
         res = self.smart.getCandleData({
-            "exchange": EXCHANGE, "symboltoken": TOKEN,
-            "interval": interval, "fromdate": from_date, "todate": to_date
+            "exchange": exchange, "symboltoken": token,
+            "interval": "FIVE_MINUTE", "fromdate": from_date, "todate": to_date
         })
         return res['data'] if res['status'] else []
 
-    # --- ICT/SMC MODULES ---
+    def calculate_fib_levels(self, candles):
+        highs = [c[3] for c in candles[-20:]]
+        lows = [c[2] for c in candles[-20:]]
+        h, l = max(highs), min(lows)
+        diff = h - l
+        # ICT OTE (62% - 79%)
+        return {
+            "0.618": h - (diff * 0.618),
+            "0.705": h - (diff * 0.705),
+            "0.786": h - (diff * 0.786)
+        }
+
     def detect_fvg(self, candles):
         if len(candles) < 3: return None
         c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-        if c3[2] > c1[3]: return {"type": "BULLISH", "level": c1[3]} # Bull FVG
-        if c3[3] < c1[2]: return {"type": "BEARISH", "level": c1[2]} # Bear FVG
+        if c3[2] > c1[3]: return {"type": "BULLISH", "entry": c1[3], "sl": c1[2]}
+        if c3[3] < c1[2]: return {"type": "BEARISH", "entry": c1[2], "sl": c1[3]}
         return None
 
-    def detect_mss_choch(self, candles):
-        # Simplistic MSS: Displacement breaking previous high/low
-        if len(candles) < 5: return False
-        curr_close = candles[-1][4]
-        prev_high = max([c[3] for c in candles[-5:-1]])
-        prev_low = min([c[2] for c in candles[-5:-1]])
-        if curr_close > prev_high: return "BULLISH_MSS"
-        if curr_close < prev_low: return "BEARISH_MSS"
-        return False
-
-    def is_killzone(self):
-        now_ist = dt.now() + timedelta(hours=5, minutes=30)
-        h, m = now_ist.hour, now_ist.minute
-        # Silver Bullet (10 AM - 11 AM IST & 2 PM - 3 PM IST)
-        if (10 <= h < 11) or (14 <= h < 15): return "SILVER_BULLET"
-        # London Open (1:30 PM - 3:30 PM IST)
-        if (13 <= h < 15) and (h > 13 or m >= 30): return "LONDON_OPEN"
-        return "ANY"
-
-    def place_order(self, side, price):
+    def place_smart_order(self, stock, side, price, sl):
+        # Position Sizing based on ₹21,000 capital and 2% risk
+        risk_amt = CAPITAL * RISK_PER_TRADE
+        sl_points = abs(price - sl)
+        if sl_points == 0: return
+        qty = int(risk_amt / sl_points)
+        if qty < 1: qty = 1
+        
         params = {
-            "variety": "NORMAL", "tradingsymbol": SYMBOL, "symboltoken": TOKEN,
-            "transactiontype": side, "exchange": EXCHANGE, "ordertype": "LIMIT",
-            "producttype": "INTRADAY", "duration": "DAY", "price": str(price), "quantity": "50"
+            "variety": "NORMAL", "tradingsymbol": stock['symbol'], "symboltoken": stock['token'],
+            "transactiontype": side, "exchange": stock['exchange'], "ordertype": "LIMIT",
+            "producttype": "INTRADAY", "duration": "DAY", "price": str(round(price, 2)), "quantity": str(qty)
         }
         res = self.smart.placeOrder(params)
-        if res['status']: log.info(f"ORDER PLACED: {side} @ {price}")
+        if res['status']: log.info(f"ORDER: {side} {stock['symbol']} QTY:{qty} @ {price}")
 
     def run(self):
         if not self.login(): return
         
-        candles = self.get_data()
-        kz = self.is_killzone()
-        fvg = self.detect_fvg(candles)
-        mss = self.detect_mss_choch(candles)
+        for stock in SCAN_LIST:
+            candles = self.get_data(stock['token'], stock['exchange'])
+            if not candles: continue
+            
+            fvg = self.detect_fvg(candles)
+            fib = self.calculate_fib_levels(candles)
+            curr_price = candles[-1][4]
 
-        log.info(f"Scan Result - KZ: {kz}, MSS: {mss}, FVG: {fvg['type'] if fvg else 'None'}")
-
-        # --- STRATEGY: LIQUIDITY SWEEP + MSS + FVG ---
-        if kz != "ANY" and mss and fvg:
-            if "BULLISH" in mss and fvg['type'] == "BULLISH":
-                self.place_order("BUY", fvg['level'])
-            elif "BEARISH" in mss and fvg['type'] == "BEARISH":
-                self.place_order("SELL", fvg['level'])
-        
-        # --- STRATEGY: SILVER BULLET ---
-        elif kz == "SILVER_BULLET" and fvg:
-            side = "BUY" if fvg['type'] == "BULLISH" else "SELL"
-            self.place_order(side, fvg['level'])
+            # CONFLUENCE: FVG + FIB OTE (70.5%)
+            if fvg:
+                if fvg['type'] == "BULLISH" and curr_price <= fib['0.705']:
+                    self.place_smart_order(stock, "BUY", fvg['entry'], fvg['sl'])
+                elif fvg['type'] == "BEARISH" and curr_price >= fib['0.618']:
+                    self.place_smart_order(stock, "SELL", fvg['entry'], fvg['sl'])
 
 if __name__ == "__main__":
-    ICTSMCBot().run()
+    ICTSMCProBot().run()
