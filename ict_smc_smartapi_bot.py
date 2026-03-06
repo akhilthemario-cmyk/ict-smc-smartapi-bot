@@ -14,15 +14,15 @@ from collections import deque
 from typing import List, Dict, Optional
 
 # ---------- CONFIG ----------
-API_KEY        = os.environ.get("API_KEY", "")
-CLIENT_CODE    = os.environ.get("CLIENT_CODE", "")
-PIN            = os.environ.get("PIN", "")
-CLIENT_SECRET  = os.environ.get("CLIENT_SECRET", "")
-TOTP_SECRET    = os.environ.get("TOTP_SECRET", "")
+API_KEY         = os.environ.get("API_KEY", "")
+CLIENT_CODE     = os.environ.get("CLIENT_CODE", "")
+PIN             = os.environ.get("PIN", "")
+CLIENT_SECRET   = os.environ.get("CLIENT_SECRET", "")
+TOTP_SECRET     = os.environ.get("TOTP_SECRET", "")
 
-SYMBOL         = "NIFTY24MARFUT"
-TOKEN          = "12345"
-EXCHANGE       = "NFO"
+SYMBOL          = "NIFTY24MARFUT"
+TOKEN           = "12345"
+EXCHANGE        = "NFO"
 
 MAX_DAILY_LOSS      = 5000.0
 MAX_DAILY_TRADES    = 30
@@ -34,11 +34,12 @@ LOG_LEVEL = logging.INFO
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ICT_SMC_BOT")
 
+
 class SmartApiSession:
     def __init__(self):
-        self.obj          = SmartConnect(api_key=API_KEY)
-        self.authToken    = None
-        self.feedToken    = None
+        self.obj = SmartConnect(api_key=API_KEY)
+        self.authToken = None
+        self.feedToken = None
         self.refreshToken = None
 
     def login(self):
@@ -46,15 +47,22 @@ class SmartApiSession:
             log.error("CRITICAL: TOTP_SECRET not provided or invalid. Bot cannot login.")
             return False
         try:
-            otp  = pyotp.TOTP(TOTP_SECRET).now()
+            # Fix: ensure uppercase and proper base32 padding
+            totp_clean = TOTP_SECRET.upper().strip().replace(" ", "")
+            missing = len(totp_clean) % 8
+            if missing:
+                totp_clean += '=' * (8 - missing)
+            log.info(f"TOTP secret length after pad: {len(totp_clean)}")
+            otp = pyotp.TOTP(totp_clean).now()
+            log.info(f"Generated TOTP code: {otp}")
             data = self.obj.generateSession(CLIENT_CODE, PIN, otp)
             if not data.get("status"):
                 log.error(f"Login failed: {data}")
                 return False
-            self.authToken    = data["data"]["jwtToken"]
+            self.authToken = data["data"]["jwtToken"]
             self.refreshToken = data["data"]["refreshToken"]
-            self.feedToken    = self.obj.getfeedToken()
-            profile           = self.obj.getProfile(self.refreshToken)
+            self.feedToken = self.obj.getfeedToken()
+            profile = self.obj.getProfile(self.refreshToken)
             log.info(f"Successfully logged in as {profile['data']['name']}")
             return True
         except Exception as e:
@@ -64,91 +72,108 @@ class SmartApiSession:
     def logout(self):
         try:
             self.obj.terminateSession(CLIENT_CODE)
-            log.info("Session terminated")
+            log.info("Logged out successfully.")
         except Exception as e:
-            log.warning(f"Logout error: {e}")
+            log.error(f"Logout error: {e}")
 
-session = SmartApiSession()
-smart   = session.obj
 
-class RiskEngine:
+class ICTDetectors:
+    @staticmethod
+    def detect_asian_session_range(candles):
+        return {"high": 19500, "low": 19450, "detected": True}
+    @staticmethod
+    def detect_fair_value_gap(candles):
+        return []
+    @staticmethod
+    def detect_orderblock(candles):
+        return []
+    @staticmethod
+    def detect_market_structure_shift(candles):
+        return False
+    @staticmethod
+    def detect_change_of_character(candles):
+        return False
+    @staticmethod
+    def detect_liquidity_sweep(candles):
+        return False
+    @staticmethod
+    def detect_turtle_soup(candles):
+        return False
+    @staticmethod
+    def detect_killzones(t):
+        h = t.hour
+        if 2 <= h < 5: return "Asian"
+        elif 7 <= h < 10: return "London"
+        elif 13 <= h < 16: return "NewYork"
+        return "None"
+
+
+class RiskManager:
     def __init__(self):
         self.daily_pnl = 0.0
-        self.trades    = 0
-        self.ord_times = deque(maxlen=100)
+        self.daily_trades = 0
+        self.open_exposure = 0.0
+        self.kill_switch_active = False
 
-    def record_order(self):
-        now    = time.time()
-        self.ord_times.append(now)
-        recent = [t for t in self.ord_times if now - t <= 1.0]
-        if len(recent) > MAX_ORDERS_PER_SEC:
-            raise Exception("OPS limit breached - throttling")
+    def check_daily_loss(self):
+        if abs(self.daily_pnl) >= MAX_DAILY_LOSS:
+            self.kill_switch_active = True
+            return True
+        return False
 
-    def can_trade(self, est_loss: float, est_exposure: float) -> bool:
-        if self.daily_pnl <= -MAX_DAILY_LOSS:
-            log.warning("Daily loss limit reached")
-            return False
-        if self.trades >= MAX_DAILY_TRADES:
-            log.warning("Max daily trades reached")
-            return False
-        if est_exposure > MAX_OPEN_EXPOSURE:
-            log.warning("Exposure limit exceeded")
-            return False
-        return True
 
-risk = RiskEngine()
+class CoreICTStrategy:
+    def __init__(self, s, r): self.s = s; self.r = r
+    def run(self, c):
+        log.info("[STRATEGY] Core ICT")
+        fvgs = ICTDetectors.detect_fair_value_gap(c)
+        mss = ICTDetectors.detect_market_structure_shift(c)
+        if fvgs and mss: log.info("Core ICT signal")
 
-def place_limit_order(side: str, price: float, qty: int):
-    orderparams = {
-        "variety":         "NORMAL",
-        "tradingsymbol":   SYMBOL,
-        "symboltoken":     str(TOKEN),
-        "transactiontype": side,
-        "exchange":        EXCHANGE,
-        "ordertype":       ALLOWED_ORDER_TYPE,
-        "producttype":     "INTRADAY",
-        "duration":        "DAY",
-        "price":           str(round(price, 2)),
-        "squareoff":       "0",
-        "stoploss":        "0",
-        "quantity":        str(int(qty)),
-    }
-    risk.record_order()
-    resp = smart.placeOrder(orderparams)
-    log.info(f"Order: {side} {qty} {SYMBOL} @ {price}, resp={resp}")
-    risk.trades += 1
-    return resp
+class TurtleSoupStrategy:
+    def __init__(self, s, r): self.s = s; self.r = r
+    def run(self, c):
+        log.info("[STRATEGY] Turtle Soup")
+        if ICTDetectors.detect_turtle_soup(c): log.info("Turtle Soup signal")
 
-def get_candles(interval: str, start: dt.datetime, end: dt.datetime):
-    params = {
-        "exchange":    EXCHANGE,
-        "symboltoken": TOKEN,
-        "interval":    interval,
-        "fromdate":    start.strftime("%Y-%m-%d %H:%M"),
-        "todate":      end.strftime("%Y-%m-%d %H:%M"),
-    }
-    data = smart.getCandleData(params)
-    return data.get("data", []) if data.get("status") else []
+class SilverBulletStrategy:
+    def __init__(self, s, r): self.s = s; self.r = r
+    def run(self, c):
+        log.info("[STRATEGY] Silver Bullet")
+        kz = ICTDetectors.detect_killzones(dt.datetime.now())
+        fvgs = ICTDetectors.detect_fair_value_gap(c)
+        if kz != "None" and fvgs: log.info(f"Silver Bullet signal: {kz}")
 
-def run_once():
-    log.info("Starting strategy cycle...")
+class AsianRangeBreakStrategy:
+    def __init__(self, s, r): self.s = s; self.r = r
+    def run(self, c):
+        log.info("[STRATEGY] Asian Range Break")
+        a = ICTDetectors.detect_asian_session_range(c)
+        if a["detected"]: log.info(f"Asian range: {a['low']}-{a['high']}")
+
+class PureSMCStrategy:
+    def __init__(self, s, r): self.s = s; self.r = r
+    def run(self, c):
+        log.info("[STRATEGY] Pure SMC")
+        if ICTDetectors.detect_change_of_character(c) and ICTDetectors.detect_liquidity_sweep(c):
+            log.info("Pure SMC signal")
+
+
+def main():
+    log.info("Starting ICT/SMC SmartAPI Bot...")
+    session = SmartApiSession()
     if not session.login():
+        log.error("Login failed. Exiting.")
         return
-    now   = dt.datetime.now()
-    start = now - dt.timedelta(hours=4)
-    raw   = get_candles("FIVE_MINUTE", start, now)
-    if not raw:
-        log.warning("No candle data fetched")
-        return
-    last_close = raw[-1][4]
-    prev_close = raw[-2][4]
-    if last_close > prev_close:
-        side = "BUY"
-    else:
-        side = "SELL"
-    qty = 50
-    if risk.can_trade(0, last_close * qty):
-        place_limit_order(side, last_close, qty)
+    risk_mgr = RiskManager()
+    candles = [{"open": 19480, "high": 19500, "low": 19470, "close": 19490, "volume": 1000}]
+    for strat in [CoreICTStrategy, TurtleSoupStrategy, SilverBulletStrategy, AsianRangeBreakStrategy, PureSMCStrategy]:
+        if risk_mgr.kill_switch_active:
+            break
+        strat(session, risk_mgr).run(candles)
+    session.logout()
+    log.info("Bot cycle complete.")
+
 
 if __name__ == "__main__":
-    run_once()
+    main()
