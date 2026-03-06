@@ -44,21 +44,40 @@ class SmartApiSession:
 
     def login(self):
         if not TOTP_SECRET or len(TOTP_SECRET) < 5:
-            log.error("CRITICAL: TOTP_SECRET not provided or invalid. Bot cannot login.")
+            log.error("CRITICAL: TOTP_SECRET not provided or invalid.")
             return False
         try:
-            # Fix: ensure uppercase and proper base32 padding
+            # Ensure uppercase and proper base32 padding
             totp_clean = TOTP_SECRET.upper().strip().replace(" ", "")
             missing = len(totp_clean) % 8
             if missing:
                 totp_clean += '=' * (8 - missing)
-            log.info(f"TOTP secret length after pad: {len(totp_clean)}")
-            otp = pyotp.TOTP(totp_clean).now()
-            log.info(f"Generated TOTP code: {otp}")
+            log.info(f"TOTP secret padded length: {len(totp_clean)}")
+
+            # Try current window first, then try adjacent windows for clock skew
+            totp_obj = pyotp.TOTP(totp_clean)
+            # valid_window=2 allows ±2 intervals (±60 sec) tolerance
+            otp = totp_obj.now()
+            log.info(f"Generated TOTP: {otp}")
+
+            # Try login with current OTP
             data = self.obj.generateSession(CLIENT_CODE, PIN, otp)
             if not data.get("status"):
-                log.error(f"Login failed: {data}")
-                return False
+                log.warning(f"TOTP attempt 1 failed ({otp}): {data.get('message')} - trying adjacent windows")
+                # Try previous window
+                import math
+                prev_otp = totp_obj.at(time.time() - 30)
+                log.info(f"Trying previous window TOTP: {prev_otp}")
+                data = self.obj.generateSession(CLIENT_CODE, PIN, prev_otp)
+                if not data.get("status"):
+                    log.warning(f"TOTP attempt 2 failed ({prev_otp}): {data.get('message')} - trying next window")
+                    next_otp = totp_obj.at(time.time() + 30)
+                    log.info(f"Trying next window TOTP: {next_otp}")
+                    data = self.obj.generateSession(CLIENT_CODE, PIN, next_otp)
+                    if not data.get("status"):
+                        log.error(f"All TOTP attempts failed. Last error: {data}")
+                        return False
+
             self.authToken = data["data"]["jwtToken"]
             self.refreshToken = data["data"]["refreshToken"]
             self.feedToken = self.obj.getfeedToken()
