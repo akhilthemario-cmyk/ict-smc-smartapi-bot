@@ -1,4 +1,4 @@
-import os, pyotp, logging, requests
+import os, pyotp, logging, requests, time
 from SmartApi import SmartConnect
 from datetime import datetime as dt, timedelta
 
@@ -9,10 +9,10 @@ PIN = os.environ.get("PIN", "")
 TOTP_SECRET = os.environ.get("TOTP_SECRET", "")
 CAPITAL = 21000.0
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("ULTRA_ICT_BOT")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger("PRO_ICT_SMC")
 
-class UltraBot:
+class ProBot:
     def __init__(self):
         self.smart = SmartConnect(api_key=API_KEY)
         self.instruments = None
@@ -22,60 +22,76 @@ class UltraBot:
         res = self.smart.generateSession(CLIENT_CODE, PIN, totp)
         return res['status']
 
-    def fetch_instruments(self):
+    def fetch_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_Standard/token/OpenAPIScripMaster.json"
         self.instruments = requests.get(url).json()
 
-    def get_atm_option(self, symbol, spot_price, option_type):
-        # Round spot to nearest 50/100 for Nifty/BankNifty ATM
-        strike = round(spot_price / 50) * 50 if "NIFTY" in symbol else round(spot_price / 100) * 100
-        # Filter for current week expiry ATM
-        matches = [i for i in self.instruments if i['name'] == symbol and i['exch_seg'] == "NFO" 
-                   and i['symbol'].endswith(option_type) and float(i['strike']) == strike]
-        return matches[0] if matches else None
-
-    def detect_setup(self, token, exchange):
+    def get_data(self, token, exchange, days=2):
         to_date = dt.now().strftime('%Y-%m-%d %H:%M')
-        from_date = (dt.now() - timedelta(days=2)).strftime('%Y-%m-%d %H:%M')
+        from_date = (dt.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M')
         res = self.smart.getCandleData({"exchange": exchange, "symboltoken": token, "interval": "FIVE_MINUTE", "fromdate": from_date, "todate": to_date})
-        if not res['status'] or not res['data']: return None
-        
-        candles = res['data']
-        c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-        highs = [c[3] for c in candles[-20:]]
-        lows = [c[2] for c in candles[-20:]]
-        fib_705 = max(highs) - (max(highs) - min(lows)) * 0.705
+        return res['data'] if res['status'] else []
 
-        if c3[2] > c1[3] and c3[4] <= fib_705: return "BUY"
-        if c3[3] < c1[2] and c3[4] >= fib_705: return "SELL"
+    # --- CORE DETECTORS ---
+    def detect_mss(self, candles):
+        if len(candles) < 5: return None
+        closes = [c[4] for c in candles]
+        highs = [c[3] for c in candles[-5:-1]]
+        lows = [c[2] for c in candles[-5:-1]]
+        if closes[-1] > max(highs): return "BULLISH_MSS"
+        if closes[-1] < min(lows): return "BEARISH_MSS"
         return None
+
+    def detect_fvg(self, candles):
+        if len(candles) < 3: return None
+        c1, c2, c3 = candles[-3], candles[-2], candles[-1]
+        if c3[2] > c1[3]: return {"type": "BULL", "entry": c1[3]}
+        if c3[3] < c1[2]: return {"type": "BEAR", "entry": c1[2]}
+        return None
+
+    def get_fib_ote(self, candles):
+        h = max([c[3] for c in candles[-20:]])
+        l = min([c[2] for c in candles[-20:]])
+        return l + (h - l) * 0.705 # OTE 70.5% Level
+
+    # --- STRATEGY ENGINE ---
+    def check_strategies(self, name, token, exchange):
+        candles = self.get_data(token, exchange)
+        if not candles: return None
+        
+        mss = self.detect_mss(candles)
+        fvg = self.detect_fvg(candles)
+        ote = self.get_fib_ote(candles)
+        curr = candles[-1][4]
+        
+        # 1. Core ICT (MSS + OTE + FVG)
+        if mss and fvg and (curr <= ote if "BULL" in mss else curr >= ote):
+            return "ICT_CORE"
+        
+        # 2. Silver Bullet (Time based)
+        ist_now = dt.now() + timedelta(hours=5, minutes=30)
+        if (10 <= ist_now.hour < 11) and fvg:
+            return "SILVER_BULLET"
+            
+        # 3. Turtle Soup (Sweep + MSS)
+        if mss: return "TURTLE_SOUP"
+        
+        return None
+
+    def execute(self, name, token, exchange):
+        strat = self.check_strategies(name, token, exchange)
+        if strat:
+            log.info(f"STRATEGY TRIGGERED: {strat} on {name}")
+            # Entry logic (as per previous ATM option code)
+            # self.smart.placeOrder(...)
 
     def run(self):
         if not self.login(): return
-        self.fetch_instruments()
-        
-        # Define Universe: Top 50 + BankNifty + Crude (MCX)
-        universe = [
-            {"name": "NIFTY", "token": "99926000", "exch": "NSE"},
-            {"name": "BANKNIFTY", "token": "99926009", "exch": "NSE"},
-            {"name": "CRUDEOIL", "token": "210000", "exch": "MCX"} # Placeholder token
-        ]
-        
+        self.fetch_master()
+        # Scan Nifty 50 universe
+        universe = [{"name": "NIFTY", "token": "99926000", "exch": "NSE"}] # Expand to all 50
         for asset in universe:
-            signal = self.detect_setup(asset['token'], asset['exch'])
-            if signal:
-                # Fetch Spot Price for ATM
-                spot = self.smart.getLTP(asset['exch'], asset['name'], asset['token'])['data']['ltp']
-                opt = self.get_atm_option(asset['name'], spot, "CE" if signal == "BUY" else "PE")
-                
-                if opt:
-                    # Place ATM Option Trade
-                    self.smart.placeOrder({
-                        "variety": "NORMAL", "tradingsymbol": opt['symbol'], "symboltoken": opt['token'],
-                        "transactiontype": signal, "exchange": "NFO", "ordertype": "MARKET",
-                        "producttype": "INTRADAY", "duration": "DAY", "quantity": opt['lotsize']
-                    })
-                    log.info(f"TRADED ATM {opt['symbol']} for {asset['name']}")
+            self.execute(asset['name'], asset['token'], asset['exch'])
 
 if __name__ == "__main__":
-    UltraBot().run()
+    ProBot().run()
